@@ -1,0 +1,136 @@
+# .github/workflows/deploy.yml
+name: Advanced Deployment Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: my-app-repo
+  CLUSTER_NAME: production-cluster
+  SERVICE_NAME: my-app-service
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+      
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+      
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker buildx build \
+          --platform linux/amd64,linux/arm64 \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+          --push \
+          .
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        
+    - name: Run Unit Tests
+      run: |
+        docker run ${{ steps.build-image.outputs.image }} npm test
+        
+    - name: Run Integration Tests
+      run: |
+        docker-compose -f docker-compose.test.yml up -d
+        docker run --network container:my-app-test ${{ steps.build-image.outputs.image }} npm run test:integration
+        docker-compose -f docker-compose.test.yml down
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Deploy to ECS with Blue/Green
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: .aws/task-definition.json
+        service: ${{ env.SERVICE_NAME }}
+        cluster: ${{ env.CLUSTER_NAME }}
+        codedeploy-application: my-app-codedeploy
+        codedeploy-deployment-group: my-app-dg
+        wait-for-service-stability: true
+        
+    - name: Run Smoke Tests
+      run: |
+        # Implement smoke tests against new deployment
+        # If tests fail, the CodeDeploy will automatically roll back
+        
+    - name: Scale Based on Metrics
+      run: |
+        # Check CloudWatch metrics and adjust service count
+        CURRENT_LOAD=$(aws cloudwatch get-metric-statistics \
+          --namespace AWS/ECS \
+          --metric-name CPUUtilization \
+          --dimensions Name=ClusterName,Value=$CLUSTER_NAME Name=ServiceName,Value=$SERVICE_NAME \
+          --start-time $(date -u +"%Y-%m-%dT%H:%M:%SZ" --date '-5 minutes') \
+          --end-time $(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+          --period 60 \
+          --statistics Average \
+          --query 'Datapoints[0].Average' \
+          --output text)
+        
+        if (( $(echo "$CURRENT_LOAD > 70" | bc -l) )); then
+          DESIRED_COUNT=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].desiredCount' \
+            --output text)
+          NEW_COUNT=$((DESIRED_COUNT + 1))
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --desired-count $NEW_COUNT
+        fi
+
+  rollback:
+    needs: deploy
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Trigger Rollback
+      run: |
+        # Get the last successful deployment
+        LAST_GOOD_DEPLOY=$(aws deploy list-deployments \
+          --application-name my-app-codedeploy \
+          --deployment-group-name my-app-dg \
+          --include-only-statuses Succeeded \
+          --query 'deployments[0]' \
+          --output text)
+          
+        # Trigger rollback
+        aws deploy create-deployment \
+          --application-name my-app-codedeploy \
+          --deployment-group-name my-app-dg \
+          --revision revisionType=AppSpecContent,appSpecContent='{"version":0,"Resources":[{"TargetService":{"Type":"AWS::ECS::Service","Properties":{"TaskDefinition":"<PREVIOUS_TASK_DEF>","LoadBalancerInfo":{"ContainerName":"web","ContainerPort":80}}}}]}'
